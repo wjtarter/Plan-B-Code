@@ -1,0 +1,1533 @@
+---
+title: "Plan B"
+author: "Wyatt Tarter"
+output: word_document
+---
+
+```{r, include=FALSE}
+knitr::opts_chunk$set(echo = F)
+
+# load necessary packages
+library(readr)
+library(tidyverse)
+library(factoextra)
+library(cluster)
+library(forcats)
+library(ggpubr)
+library(viridis)
+library(lme4)
+library(broom.mixed)
+library(fda)
+library(quantreg)
+library(ggpubr)
+
+BridgesAlpha <- read_csv("C:/Users/wjtar/Desktop/Research/Plan B/filtered_timecourses.csv")%>%
+  filter(time>10)%>%
+  data.frame()
+
+# Split by patient
+BridgesAlphaSplit<-split(BridgesAlpha,BridgesAlpha$grid)
+
+# Length of a time course
+TIME<-length(BridgesAlpha$grid[BridgesAlpha$grid=="10038"])
+
+# 3DDespiking
+basis = getbasismatrix(seq(1,TIME),
+                       create.fourier.basis(rangeval = c(0,TIME),
+                                            nbasis=2*round((TIME/30/2))+1))
+c1 = 2.5
+c2 = 4
+
+# Loop across each individual and component time course       
+for(i in 1:length(BridgesAlphaSplit)){
+  for(j in 2:31){
+    quantile.reg = rq(BridgesAlphaSplit[[i]][[j]]~basis-1) # 
+    residuals = quantile.reg %>% 
+    resid()
+    s = residuals/mad(residuals)
+    s.prime = s
+    for(id in which(s > c1)){
+    s.prime[id] = c1 + (c2-c1)*tanh((s[id]-c1)/(c2-c1))
+    }
+    BridgesAlphaSplit[[i]][[j]] = quantile.reg %>% 
+      fitted() + s.prime*mad(residuals)
+  }
+}
+
+# Unsplit by patient after despiking
+Bridges<-unsplit(BridgesAlphaSplit,
+                 BridgesAlpha$grid)
+```
+
+
+# Sliding Windows
+```{r, include=FALSE}
+
+# Window Size
+Scale<-75
+# Sliding Increment Size
+Slide<-15
+
+# Splitting by Patient Id for looping
+Bridges3<-split(Bridges,Bridges$grid)
+Patients3<-list() # Sliding Windows list
+# Loop through each element by window size, slide forward, repeat for each individual
+for(i in 1:length(Bridges3)){
+  Patients3[[i]]<-lapply(seq(1,length(Bridges3[[i]]$time)-Scale-1,by=Slide), function(x) cov(Bridges3[[i]][x:(x+Scale-1),3:31]))
+}
+
+# Define KL divergence
+KL.divergence = function(Sigma1,Sigma2,Omega1=NULL,Omega2=NULL){
+  if(is.null(Omega1)){
+    Omega1 = solve(Sigma1)
+  }
+  if(is.null(Omega2)){
+    Omega2 = solve(Sigma2)
+  }
+  return(sum(diag((Sigma1-Sigma2)%*%(Omega2-Omega1))))
+}
+
+# Define distances
+get.distances = function(Sigma,Omega=NULL){
+  # Sigma is a list of covariance matrices
+  # Omega is a list of precision matrices
+  K = length(Sigma)
+  if(is.null(Omega)){
+    Omega = vector("list",length = K)
+    for(k in 1:K){
+      Omega[[k]] = solve(Sigma[[k]])
+    }
+  }
+  dist.mat = matrix(999,nrow=K,ncol=K)
+  for(j in 1:(K-1)){
+    for(k in (j+1):K){
+      dist.mat[j,k] = KL.divergence(Sigma[[j]],Sigma[[k]],Omega[[j]],Omega[[k]])
+      dist.mat[k,j] = dist.mat[j,k]
+    }
+  }
+  return(dist.mat)
+}
+
+# Unlist sliding windows analysis
+PA3<-Patients3%>%unlist(recursive = F)
+# obtain KL divergence
+P_33<-get.distances(PA3)%>%as.dist()%>%as.matrix()
+
+# Elbow Plot
+fviz_nbclust(P_33, kmeans, method = "wss")
+# Silhouette Plot
+fviz_nbclust(P_33, kmeans, method = "silhouette")
+
+# Gap statistic
+gap_stat <- clusGap(P_33, FUN = kmeans, nstart = 25,
+                    K.max = 15, B = 50)
+# Plot
+fviz_gap_stat(gap_stat)
+
+# K-means clustering for k=3, 4, 5, 6
+P2Clust3A<-P_33%>%kmeans(centers = 3)
+P2Clust3B<-P_33%>%kmeans(centers = 4)
+P2Clust3C<-P_33%>%kmeans(centers = 5)
+P2Clust3D<-P_33%>%kmeans(centers = 6)
+
+P_33_<-P_33%>%data.frame()
+
+# Dimension reduction using PCA
+res.pca3 <- prcomp(P_33_,  scale = TRUE)
+
+# Coordinates of individuals
+ind.coord3 <- as.data.frame(get_pca_ind(res.pca3)$coord)
+
+# Add clusters obtained using the K-means algorithm
+ind.coord3$cluster <- factor(P2Clust3D$cluster)
+ind.coord3$cluster2 <- factor(P2Clust3B$cluster)
+ind.coord3$cluster3 <- factor(P2Clust3C$cluster)
+ind.coord3$cluster4 <- factor(P2Clust3A$cluster)
+
+# Adding NSSI status to distance matrix
+ind.coord3$NSSI<-Bridges%>%
+  dplyr::count(grid,Lifetime.NSSI.Group)%>%
+  mutate(n=n/16.107)%>%
+  uncount(weights = n)%>%
+  dplyr::select(Lifetime.NSSI.Group)
+
+# Add NSSI groups from the original data sett
+ind.coord3[,7061] <- Bridges%>%
+  dplyr::count(grid,Lifetime.NSSI.Group)%>%
+  mutate(n=n/16.107)%>%
+  uncount(weights = n)%>%
+  dplyr::select(Lifetime.NSSI.Group)
+
+# Obtain dimension variance explanation
+eigenvalue <- round(get_eigenvalue(res.pca3), 1)
+variance.percent <- eigenvalue$variance.percent
+
+C1<-ggscatter(
+  ind.coord3, x = "Dim.1", y = "Dim.2", 
+  color = "cluster", palette = "npg", ellipse = TRUE, ellipse.type = "convex",
+  shape="NSSI", size = 1.5,  legend = "none", ggtheme = theme_bw(base_size = 15),
+  xlab = paste0("Dim 1 (", variance.percent[1], "% )" ),
+  ylab = paste0("Dim 2 (", variance.percent[2], "% )" ),
+  title = "Cluster size 6"
+) +
+  stat_mean(aes(color = cluster), size = 4)
+
+C2<-ggscatter(
+  ind.coord3, x = "Dim.1", y = "Dim.2", 
+  color = "cluster2", palette = "npg", ellipse = TRUE, ellipse.type = "convex",
+  shape="NSSI", size = 1.5,  legend = "none", ggtheme = theme_bw(base_size = 15),
+  xlab = paste0("Dim 1 (", variance.percent[1], "% )" ),
+  ylab = paste0("Dim 2 (", variance.percent[2], "% )" ),
+  title = "Cluster size 4"
+) +
+  stat_mean(aes(color = cluster2), size = 4)
+
+C3<-ggscatter(
+  ind.coord3, x = "Dim.1", y = "Dim.2", 
+  color = "cluster3", palette = "npg", ellipse = TRUE, ellipse.type = "convex",
+  shape="NSSI", size = 1.5,  legend = "none", ggtheme = theme_bw(base_size = 15),
+  xlab = paste0("Dim 1 (", variance.percent[1], "% )" ),
+  ylab = paste0("Dim 2 (", variance.percent[2], "% )" ),
+  title = "Cluster size 5",show.legend.text=FALSE
+) +
+  stat_mean(aes(color = cluster3), size = 4,show.legend = FALSE)
+
+C4<-ggscatter(
+  ind.coord3, x = "Dim.1", y = "Dim.2", 
+  color = "cluster4", palette = "npg", ellipse = TRUE, ellipse.type = "convex",
+  shape="NSSI", size = 1.5,  legend = "none", ggtheme = theme_bw(base_size = 15),
+  xlab = paste0("Dim 1 (", variance.percent[1], "% )" ),
+  ylab = paste0("Dim 2 (", variance.percent[2], "% )" ),
+  title = "Cluster size 3",show.legend.text = FALSE
+) +
+  stat_mean(aes(color = cluster4), size = 4,show.legend = FALSE)
+
+# PCA visualization Plots
+ggarrange(C4,C2,C3,C1)
+
+# Re-assigning cluster assignment to original time series
+# Split k-means clustering
+Split2<-split(P2Clust3C$cluster,
+              ceiling(seq_along(P2Clust3C$centers)/length(Patients3[[1]])))
+
+Split2<-Split2[1:126]
+
+# Add split clustering and repeat # by midpoint of window
+Merge3<-vector("list",126)
+for (i in 1:length(Split2)) {
+  for(j in 1:length(Split2[[i]])){
+    Merge3[[i]][[j]]<-rep(Split2[[i]][[j]],Slide)
+  }
+}
+
+
+# Assign clustering sequences back to individuals time courses
+for (i in 1:length(Bridges3)) {
+  for(j in 1:length(Patients3[[i]])){
+  Bridges3[[i]][[j+35]]<-c(rep(NA,(j)*(Slide)),
+                           Merge3[[i]][[j]],
+                           rep(NA,length(Bridges3[[i]][[1]])-
+                                 length(Merge3[[i]][[j]])-(j)*(Slide)))
+  }
+}
+
+# Add clustering to original time series, combine clustering columns into one
+# Add occupancy variable for switches, make cluster a factor, reorder so largest
+# cluster level is consistent
+Bridges4B<-unsplit(Bridges3,Bridges$grid)%>%
+  unite(col="Cluster",V36:V91,na.rm=T,sep="")%>%
+  mutate(Cluster=case_when(Cluster==""~lag(Cluster,n=Slide),
+                           T~Cluster),                                                                           Occupancy=case_when(Cluster!=lag(Cluster)~1,
+                             T~0),
+         Cluster=factor(Cluster))%>%
+  filter(!Cluster=="")%>%
+  mutate(Cluster=fct_infreq(Cluster,ordered = T),
+                 Cluster=factor(Cluster,labels=c(1:5)))
+
+# Reorder NSSI factor levels
+Bridges4B$Lifetime.NSSI.Group<-factor(Bridges4B$Lifetime.NSSI.Group,
+                                      levels = c("No NSSI","Mild NSSI",
+                                                 "Moderate NSSI","Severe NSSI"))
+
+# Calculate proportional occupancy, by cluster
+OccupancyDatAll3_2<-Bridges4B%>%group_by(grid,Psychotropic_med)%>%
+  count(Lifetime.NSSI.Group,Cluster)%>%
+  filter(Cluster!="")%>%
+  ungroup()%>%
+  group_by(grid,Lifetime.NSSI.Group,Psychotropic_med)%>%
+  mutate(Freq=n/sum(n),
+         Cluster=factor(Cluster,levels=c(1:5)))
+
+# Stratified by Cluster Proportional occupancy Test
+OccupancyDatAll3_2A<-OccupancyDatAll3_2%>%
+  filter(Cluster=="1")
+
+A<-lm(Freq~Lifetime.NSSI.Group+Psychotropic_med,OccupancyDatAll3_2A)%>%
+  tidy(conf.int=TRUE)%>%mutate(Cluster="1")
+
+OccupancyDatAll3_2B<-OccupancyDatAll3_2%>%
+  filter(Cluster=="2")
+
+B<-lm(Freq~Lifetime.NSSI.Group+Psychotropic_med,
+   OccupancyDatAll3_2B)%>%
+  tidy(conf.int=TRUE)%>%mutate(Cluster="2")
+
+OccupancyDatAll3_2C<-OccupancyDatAll3_2%>%
+  filter(Cluster=="3")
+
+C<-lm(Freq~Lifetime.NSSI.Group+Psychotropic_med,
+   OccupancyDatAll3_2C)%>%
+  tidy(conf.int=TRUE)%>%mutate(Cluster="3")
+
+OccupancyDatAll3_2D<-OccupancyDatAll3_2%>%
+  filter(Cluster=="4")
+
+D<-lm(Freq~Lifetime.NSSI.Group+Psychotropic_med,
+      OccupancyDatAll3_2D)%>%
+  tidy(conf.int=TRUE)%>%mutate(Cluster="4")
+
+OccupancyDatAll3_2E<-OccupancyDatAll3_2%>%
+  filter(Cluster=="5")
+
+#lm(Freq~Lifetime.NSSI.Group,OccupancyDatAll3_2)%>%summary()
+E<-lm(Freq~Lifetime.NSSI.Group+Psychotropic_med,
+      OccupancyDatAll3_2E)%>%
+  tidy(conf.int=TRUE)%>%mutate(Cluster="5")
+
+# Calculate State switching frequency by NSSI status
+StateSwitch3_2<-Bridges4B%>%filter(Cluster!="")%>%
+  group_by(Lifetime.NSSI.Group)%>%count(Occupancy)%>%ungroup()%>%
+  group_by(Lifetime.NSSI.Group)%>%
+  mutate(Freq=n/sum(n))
+
+# Calculate dwell time by cluster and NSSI status
+RLE_All3_2<-Bridges4B%>%filter(Cluster!="")%>%
+  group_by(grid,Lifetime.NSSI.Group,Psychotropic_med)%>%
+  mutate(Cluster=as.numeric(Cluster))%>%
+  summarise(RLE_cluster=rle(Cluster)$values,
+            RLE_length=rle(Cluster)$lengths)%>%
+  filter(!RLE_cluster=="")%>%
+  mutate(RLE_cluster=factor(RLE_cluster,levels = c(1:5)),
+         RLE_length=as.numeric(RLE_length),
+         grid=factor(grid))
+
+# Remove null clusters
+Bridges4C<-Bridges4B%>%filter(Cluster!="")
+
+# Logistic regression on state switching
+glm(Occupancy~Lifetime.NSSI.Group,data=Bridges4C,
+    family="binomial")%>%
+  tidy()
+
+# Mixed poisson model on dwell time
+glmer(RLE_length~Lifetime.NSSI.Group+Psychotropic_med+(1|grid),
+      family="poisson",data=subset(RLE_All3_2,RLE_cluster==1))%>%summary()
+
+
+# State switching plots
+StateSwitch<-ggplot(subset(StateSwitch3_2,Occupancy=="1"),
+       aes(x=Lifetime.NSSI.Group,fill=Lifetime.NSSI.Group,y=Freq))+
+  geom_col(show.legend = F)+scale_fill_viridis(discrete=T,begin=1,end = 0)+
+  labs(title="State Switching Frequency\nby NSSI Status")+
+  xlab(label = "Lifetime NSSI Group")+
+  ylab(label="State Switching Frequency")+theme_bw(base_size = 20)
+
+
+OccupancyDatAll3_2<-Bridges4B%>%
+  count(Lifetime.NSSI.Group,Cluster)%>%
+  filter(Cluster!="")%>%
+  ungroup()%>%
+  group_by(Lifetime.NSSI.Group)%>%
+  mutate(Freq=n/sum(n),
+         Cluster=factor(Cluster,levels=c(1:5)))
+
+StateOccup<-ggplot(OccupancyDatAll3_2,
+       aes(y=Freq,x=Lifetime.NSSI.Group,fill=Cluster))+
+  geom_col()+scale_fill_viridis(discrete = T,begin=1,end = 0)+
+  labs(title="Proportional Occupancy\nby NSSI Status")+
+  xlab(label = "Lifetime NSSI Group")+
+  ylab(label="Proportional Occupancy")+theme_bw(base_size = 20)
+
+ggarrange(StateSwitch,StateOccup)
+
+
+ggplot(RLE_All3_2,aes(x=RLE_length,fill=RLE_cluster))+
+  geom_histogram()+
+  facet_grid(RLE_cluster~Lifetime.NSSI.Group)+
+  labs(title="Dwell Time (Length of stay before switching)")+
+  xlab(label="Dwell Time")+
+  scale_fill_viridis(name="Cluster",discrete = T,begin=1,end = 0)+
+  theme_bw(base_size = 20)+scale_y_continuous(breaks=c(0,50))
+
+RLE_All3_2%>%group_by(RLE_cluster)%>%
+  summarise(Median=median(RLE_length),
+            Lower=quantile(RLE_length,probs = 0.25),
+            Upper=quantile(RLE_length,probs = 0.75))%>%
+  kable(caption="Dwell Time Descriptives")
+
+Bridges4B%>%filter(Cluster!="")%>%
+  group_by(Lifetime.NSSI.Group,grid)%>%
+  summarise(Freq=mean(Occupancy))%>%
+  ungroup()%>%
+  group_by(Lifetime.NSSI.Group)%>%
+  summarise(Mean=mean(Freq),
+            Lower=quantile(Freq,probs = 0.025),
+            Upper=quantile(Freq,probs = 0.975))%>%
+  kable(caption="State Switching Frequency Descriptives",digits = 3)
+
+OccupancyDatAll3_2%>%group_by(Cluster)%>%
+  summarise(Mean=mean(Freq),
+            Lower=quantile(Freq,probs = 0.025),
+            Upper=quantile(Freq,probs = 0.975))%>%
+  kable(caption="Proportional Occupancy Descriptives",digits = 3)
+
+RLE_All3_2<-Bridges4B%>%filter(Cluster!="")%>%
+  group_by(grid,Lifetime.NSSI.Group,Psychotropic_med)%>%
+  mutate(Cluster=as.numeric(Cluster))%>%
+  summarise(RLE_cluster=rle(Cluster)$values,
+            RLE_length=rle(Cluster)$lengths)%>%
+  filter(!RLE_cluster=="")%>%
+  mutate(RLE_cluster=factor(RLE_cluster,levels = c(1:5)),
+         RLE_length=as.numeric(RLE_length),
+         grid=factor(grid))%>%
+  group_by(Lifetime.NSSI.Group,RLE_cluster)%>%
+  summarise(RLE_length=median(RLE_length))
+```
+
+# Bootstrapping
+## 21 Patients
+```{r}
+# 100 iterations
+SampleN<-100
+Split_booty<-NULL
+Booty<-NULL
+# Bootstrap selection for each iteration i
+for(i in 1:SampleN){ # maintain NSSI proportions
+Booty_mod<-inner_join(Bridges,
+                      sample(unique(Bridges$grid[Bridges$Lifetime.NSSI.Group=="Moderate NSSI"]),
+                             size = 8,replace = F)%>%
+                        data.frame()%>%dplyr::rename(grid="."),by="grid") 
+
+Booty_no<-inner_join(Bridges,
+                     sample(unique(Bridges$grid[Bridges$Lifetime.NSSI.Group=="No NSSI"]),
+                            size = 6,replace = F)%>%
+                       data.frame()%>%dplyr::rename(grid="."),by="grid") 
+
+Booty_mild<-inner_join(Bridges,sample(unique(Bridges$grid[Bridges$Lifetime.NSSI.Group=="Mild NSSI"]),
+                                      size = 2,replace = F)%>%
+                         data.frame()%>%dplyr::rename(grid="."),by="grid") 
+
+Booty_severe<-inner_join(Bridges,sample(unique(Bridges$grid[Bridges$Lifetime.NSSI.Group=="Severe NSSI"]),
+                                        size = 5,replace = F)%>%
+                           data.frame()%>%dplyr::rename(grid="."),by="grid") 
+# Bind NSSI bootstraps
+Booty[[i]]<-rbind(Booty_mild,Booty_mod,Booty_no,Booty_severe)%>%
+  mutate(across(.cols=time:V26))%>%
+  as.data.frame()
+# Split bootstrap by individual
+Split_booty[[i]]<-split(Booty[[i]],
+                        Booty[[i]]$grid)        
+}
+
+# Sliding windows across bootstrap
+PatientsBooty<-vector("list",SampleN)
+for(j in 1:SampleN){
+  for(i in 1:21){
+  PatientsBooty[[j]][[i]]<-lapply(seq(1,
+                                      length(Split_booty[[j]][[i]][['time']])-Scale-1,
+                                      by=Slide),function(x) cov(Split_booty[[j]][[i]][x:(x+Scale-1),3:31]))
+  }
+}
+
+# Repeat distance matrix, k-means clustering, metrics, etc
+GGOccupancyP10<-NULL
+GGDwellP10<-NULL
+GGSwitchP10<-NULL
+P10<-NULL
+PAA1MCluster<-NULL
+NSSIP10<-NULL
+StateSwitchBooty<-NULL
+OccupancyDatAllBooty<-NULL
+RLE_AllBooty<-NULL
+OccTest<-NULL
+SwitchTest<-NULL
+DwellTest<-NULL
+for(i in 1:SampleN){
+PA10Booty<-PatientsBooty[[i]]%>%unlist(recursive = F) 
+
+PAA1<-get.distances(PA10Booty)%>%as.dist()%>%as.matrix()
+
+PAA1MCluster[[i]]<-kmeans(PAA1,centers = 5)
+
+
+SplitP10<-split(PAA1MCluster[[i]]$cluster,
+                ceiling(seq_along(PAA1MCluster[[i]]$centers)
+/length(PatientsBooty[[i]][[1]])))
+SplitP10<-SplitP10[1:21]
+MergeP10<-vector("list",21)
+for (p in 1:length(SplitP10)) {
+  for(j in 1:length(SplitP10[[i]])){
+    MergeP10[[p]][[j]]<-rep(SplitP10[[p]][[j]],Slide)
+  }
+}
+MergierP10<-MergeP10%>%unlist(recursive = F)
+
+for (k in 1:length(Split_booty[[1]])) {
+  for(m in 1:length(PatientsBooty[[1]][[1]])){
+  Split_booty[[i]][[k]][[m+35]]<-c(rep(NA,(m)*(Slide)),MergeP10[[k]][[m]],rep(NA,length(Split_booty[[i]][[k]][[1]])-length(MergeP10[[k]][[m]])-(m)*(Slide)))
+  }
+}
+
+
+Booty4<-unsplit(Split_booty[[i]],Booty[[i]][["grid"]])
+
+Booty4A<-Booty4%>%unite(col="Cluster",V36:V91,na.rm=T,sep="")%>%
+  mutate(Cluster=case_when(Cluster==""~lag(Cluster,n=Slide),
+                           T~Cluster),
+         Occupancy=case_when(Cluster!=lag(Cluster)~1,
+                             T~0),
+         Cluster=factor(Cluster))%>%
+  filter(!Cluster=="")%>%
+  mutate(Cluster=fct_infreq(Cluster,ordered = T),
+                 Cluster=factor(Cluster,labels=c(1:5)))
+
+# Prop Occ metric
+OccupancyDatAllBooty[[i]]<-Booty4A%>%
+  count(Lifetime.NSSI.Group,Cluster)%>%
+  filter(Cluster!="")%>%
+  ungroup()%>%
+  group_by(Lifetime.NSSI.Group)%>%
+  mutate(Freq=n/sum(n))
+
+# State switching metric
+StateSwitchBooty[[i]]<-Booty4A%>%group_by(Lifetime.NSSI.Group)%>%
+  count(Occupancy)%>%ungroup()%>%
+  group_by(Lifetime.NSSI.Group)%>%
+  mutate(Freq=n/sum(n))
+
+# Dwell time metric
+RLE_AllBooty[[i]]<-Booty4A%>%group_by(grid,Lifetime.NSSI.Group)%>%
+  mutate(Cluster=as.numeric(Cluster))%>%
+  summarise(RLE_cluster=rle(Cluster)$values,
+            RLE_length=rle(Cluster)$lengths)%>%
+  filter(!RLE_cluster=="")%>%
+  mutate(RLE_cluster=factor(RLE_cluster),
+         RLE_length=as.numeric(RLE_length),
+         grid=factor(grid))%>%
+  group_by(Lifetime.NSSI.Group,RLE_cluster)%>%
+  summarise(RLE_length=median(RLE_length))
+
+}
+
+
+```
+
+# 42
+
+```{r}
+
+Split_booty2<-NULL
+Booty2<-NULL
+for(i in 1:SampleN){
+Booty_mod<-inner_join(Bridges,sample(unique(Bridges$grid[Bridges$Lifetime.NSSI.Group=="Moderate NSSI"]),size = 16,replace = F)%>%
+                        data.frame()%>%dplyr::rename(grid="."),by="grid") 
+
+Booty_no<-inner_join(Bridges,sample(unique(Bridges$grid[Bridges$Lifetime.NSSI.Group=="No NSSI"]),
+                                    size = 12,replace = F)%>%
+                       data.frame()%>%dplyr::rename(grid="."),by="grid") 
+
+Booty_mild<-inner_join(Bridges,sample(unique(Bridges$grid[Bridges$Lifetime.NSSI.Group=="Mild NSSI"]),size = 4,replace = F)%>%
+                         data.frame()%>%dplyr::rename(grid="."),by="grid") 
+
+Booty_severe<-inner_join(Bridges,sample(unique(Bridges$grid[Bridges$Lifetime.NSSI.Group=="Severe NSSI"]),size = 10,replace = F)%>%
+                           data.frame()%>%dplyr::rename(grid="."),by="grid") 
+
+Booty2[[i]]<-rbind(Booty_mild,Booty_mod,Booty_no,Booty_severe)%>%
+  mutate(across(.cols=time:V26))%>%as.data.frame()
+Split_booty2[[i]]<-split(Booty2[[i]],Booty2[[i]]$grid)        
+}
+
+Scale<-75
+PatientsBooty2<-vector("list",SampleN)
+for(j in 1:SampleN){
+  for(i in 1:42){
+  PatientsBooty2[[j]][[i]]<-lapply(seq(1,length(Split_booty2[[j]][[i]][['time']])-Scale-1,by=Slide), function(x) cov(Split_booty2[[j]][[i]][x:(x+Scale-1),3:31]))
+  }
+}
+
+GGOccupancyP102<-NULL
+GGDwellP102<-NULL
+GGSwitchP102<-NULL
+P102<-NULL
+PAA1MCluster2<-NULL
+NSSIP102<-NULL
+StateSwitchBooty2<-NULL
+OccupancyDatAllBooty2<-NULL
+RLE_AllBooty2<-NULL
+OccTest2<-NULL
+SwitchTest2<-NULL
+DwellTest2<-NULL
+for(i in 1:SampleN){
+PA10Booty2<-PatientsBooty2[[i]]%>%unlist(recursive = F)
+
+PAA12<-get.distances(PA10Booty2)%>%as.dist()%>%as.matrix()
+PAA1MCluster2[[i]]<-kmeans(PAA12,centers = 5)
+
+
+SplitP102<-split(PAA1MCluster2[[i]]$cluster,
+                 ceiling(seq_along(PAA1MCluster2[[i]]$centers)
+/length(PatientsBooty2[[i]][[1]])))
+SplitP102<-SplitP102[1:42]
+MergeP102<-vector("list",42)
+for (p in 1:length(SplitP102)) {
+  for(j in 1:length(SplitP102[[i]])){
+    MergeP102[[p]][[j]]<-rep(SplitP102[[p]][[j]],Slide)
+  }
+}
+MergierP102<-MergeP102%>%unlist(recursive = F)
+
+for (k in 1:length(Split_booty2[[1]])) {
+  for(m in 1:length(PatientsBooty2[[1]][[1]])){
+  Split_booty2[[i]][[k]][[m+35]]<-c(rep(NA,(m)*(Slide)),MergeP102[[k]][[m]],rep(NA,length(Split_booty2[[i]][[k]][[1]])-length(MergeP102[[k]][[m]])-(m)*(Slide)))
+  }
+}
+
+
+Booty42<-unsplit(Split_booty2[[i]],Booty2[[i]][["grid"]])
+
+Booty4A2<-Booty42%>%unite(col="Cluster",V36:V91,na.rm=T,sep="")%>%
+  mutate(Cluster=case_when(Cluster==""~lag(Cluster,n=Slide),
+                           T~Cluster),
+         Occupancy=case_when(Cluster!=lag(Cluster)~1,
+                             T~0),
+         Cluster=factor(Cluster))%>%
+  filter(!Cluster=="")%>%
+  mutate(Cluster=fct_infreq(Cluster,ordered = T),
+                 Cluster=factor(Cluster,labels=c(1:5)))
+
+
+OccupancyDatAllBooty2[[i]]<-Booty4A2%>%
+  count(Lifetime.NSSI.Group,Cluster)%>%
+  filter(Cluster!="")%>%
+  ungroup()%>%
+  group_by(Lifetime.NSSI.Group)%>%
+  mutate(Freq=n/sum(n))
+
+
+StateSwitchBooty2[[i]]<-Booty4A2%>%group_by(Lifetime.NSSI.Group)%>%
+  count(Occupancy)%>%ungroup()%>%
+  group_by(Lifetime.NSSI.Group)%>%
+  mutate(Freq=n/sum(n))
+
+
+RLE_AllBooty2[[i]]<-Booty4A2%>%group_by(grid,Lifetime.NSSI.Group)%>%
+  mutate(Cluster=as.numeric(Cluster))%>%
+  summarise(RLE_cluster=rle(Cluster)$values,
+            RLE_length=rle(Cluster)$lengths)%>%
+  filter(!RLE_cluster=="")%>%
+  mutate(RLE_cluster=factor(RLE_cluster),
+         RLE_length=as.numeric(RLE_length),
+         grid=factor(grid))%>%
+  group_by(Lifetime.NSSI.Group,RLE_cluster)%>%
+  summarise(RLE_length=median(RLE_length))
+
+
+}
+
+
+
+```
+
+# 63
+
+```{r}
+
+Split_booty3<-NULL
+Booty3<-NULL
+for(i in 1:SampleN){
+Booty_mod<-inner_join(Bridges,sample(unique(Bridges$grid[Bridges$Lifetime.NSSI.Group=="Moderate NSSI"]),size = 24,replace = F)%>%
+                        data.frame()%>%dplyr::rename(grid="."),by="grid") 
+
+Booty_no<-inner_join(Bridges,sample(unique(Bridges$grid[Bridges$Lifetime.NSSI.Group=="No NSSI"]),
+                                    size = 18,replace = F)%>%
+                       data.frame()%>%dplyr::rename(grid="."),by="grid") 
+
+Booty_mild<-inner_join(Bridges,sample(unique(Bridges$grid[Bridges$Lifetime.NSSI.Group=="Mild NSSI"]),size = 6,replace = F)%>%
+                         data.frame()%>%dplyr::rename(grid="."),by="grid") 
+
+Booty_severe<-inner_join(Bridges,sample(unique(Bridges$grid[Bridges$Lifetime.NSSI.Group=="Severe NSSI"]),size = 15,replace = F)%>%
+                           data.frame()%>%dplyr::rename(grid="."),by="grid") 
+
+Booty3[[i]]<-rbind(Booty_mild,Booty_mod,Booty_no,Booty_severe)%>%
+  mutate(across(.cols=time:V26))%>%as.data.frame()
+Split_booty3[[i]]<-split(Booty3[[i]],Booty3[[i]]$grid)        
+}
+
+Scale<-75
+PatientsBooty3<-vector("list",SampleN)
+for(j in 1:SampleN){
+  for(i in 1:63){
+  PatientsBooty3[[j]][[i]]<-lapply(seq(1,length(Split_booty3[[j]][[i]][['time']])-Scale-1,by=Slide), function(x) cov(Split_booty3[[j]][[i]][x:(x+Scale-1),3:31]))
+  }
+}
+
+GGOccupancyP103<-NULL
+GGDwellP103<-NULL
+GGSwitchP103<-NULL
+P103<-NULL
+PAA1MCluster3<-NULL
+NSSIP103<-NULL
+StateSwitchBooty3<-NULL
+OccupancyDatAllBooty3<-NULL
+OccTest3<-NULL
+SwitchTest3<-NULL
+DwellTest3<-NULL
+for(i in 1:SampleN){
+PA10Booty3<-PatientsBooty3[[i]]%>%unlist(recursive = F)
+
+PAA13<-get.distances(PA10Booty3)%>%as.dist()%>%as.matrix()
+PAA1MCluster3[[i]]<-kmeans(PAA13,centers = 5)
+
+SplitP103<-split(PAA1MCluster3[[i]]$cluster,
+                 ceiling(seq_along(PAA1MCluster3[[i]]$centers)
+/length(PatientsBooty3[[i]][[1]])))
+SplitP103<-SplitP103[1:63]
+MergeP103<-vector("list",63)
+for (p in 1:length(SplitP103)) {
+  for(j in 1:length(SplitP103[[i]])){
+    MergeP103[[p]][[j]]<-rep(SplitP103[[p]][[j]],Slide)
+  }
+}
+MergierP103<-MergeP103%>%unlist(recursive = F)
+
+for (k in 1:length(Split_booty3[[1]])) {
+  for(m in 1:length(PatientsBooty3[[1]][[1]])){
+  Split_booty3[[i]][[k]][[m+35]]<-c(rep(NA,(m)*(Slide)),MergeP103[[k]][[m]],rep(NA,length(Split_booty3[[i]][[k]][[1]])-length(MergeP103[[k]][[m]])-(m)*(Slide)))
+  }
+}
+
+
+Booty43<-unsplit(Split_booty3[[i]],Booty3[[i]][["grid"]])
+
+Booty4A3<-Booty43%>%unite(col="Cluster",V36:V91,na.rm=T,sep="")%>%
+  mutate(Cluster=case_when(Cluster==""~lag(Cluster,n=Slide),
+                           T~Cluster),
+         Occupancy=case_when(Cluster!=lag(Cluster)~1,
+                             T~0),
+         Cluster=factor(Cluster))%>%
+  filter(!Cluster=="")%>%
+  mutate(Cluster=fct_infreq(Cluster,ordered = T),
+                 Cluster=factor(Cluster,labels=c(1:5)))
+
+
+OccupancyDatAllBooty3[[i]]<-Booty4A3%>%
+  count(Lifetime.NSSI.Group,Cluster)%>%
+  filter(Cluster!="")%>%
+  ungroup()%>%
+  group_by(Lifetime.NSSI.Group)%>%
+  mutate(Freq=n/sum(n))
+
+
+StateSwitchBooty3[[i]]<-Booty4A3%>%group_by(Lifetime.NSSI.Group)%>%
+  count(Occupancy)%>%ungroup()%>%
+  group_by(Lifetime.NSSI.Group)%>%
+  mutate(Freq=n/sum(n))
+
+
+RLE_AllBooty3[[i]]<-Booty4A3%>%group_by(grid,Lifetime.NSSI.Group)%>%
+  mutate(Cluster=as.numeric(Cluster))%>%
+  summarise(RLE_cluster=rle(Cluster)$values,
+            RLE_length=rle(Cluster)$lengths)%>%
+  filter(!RLE_cluster=="")%>%
+  mutate(RLE_cluster=factor(RLE_cluster),
+         RLE_length=as.numeric(RLE_length),
+         grid=factor(grid))%>%
+  group_by(Lifetime.NSSI.Group,RLE_cluster)%>%
+  summarise(RLE_length=median(RLE_length))
+
+
+}
+
+
+```
+
+
+# 84
+
+```{r}
+
+Split_booty4<-NULL
+Booty4<-NULL
+for(i in 1:SampleN){
+Booty_mod<-inner_join(Bridges,sample(unique(Bridges$grid[Bridges$Lifetime.NSSI.Group=="Moderate NSSI"]),size = 32,replace = F)%>%
+                        data.frame()%>%dplyr::rename(grid="."),by="grid") 
+
+Booty_no<-inner_join(Bridges,sample(unique(Bridges$grid[Bridges$Lifetime.NSSI.Group=="No NSSI"]),
+                                    size = 24,replace = F)%>%
+                       data.frame()%>%dplyr::rename(grid="."),by="grid") 
+
+Booty_mild<-inner_join(Bridges,sample(unique(Bridges$grid[Bridges$Lifetime.NSSI.Group=="Mild NSSI"]),size = 8,replace = F)%>%
+                         data.frame()%>%dplyr::rename(grid="."),by="grid") 
+
+Booty_severe<-inner_join(Bridges,sample(unique(Bridges$grid[Bridges$Lifetime.NSSI.Group=="Severe NSSI"]),size = 20,replace = F)%>%
+                           data.frame()%>%dplyr::rename(grid="."),by="grid") 
+
+Booty4[[i]]<-rbind(Booty_mild,Booty_mod,Booty_no,Booty_severe)%>%
+  mutate(across(.cols=time:V26))%>%as.data.frame()
+Split_booty4[[i]]<-split(Booty4[[i]],Booty4[[i]]$grid)        
+}
+
+Scale<-75
+PatientsBooty4<-vector("list",SampleN)
+for(j in 1:SampleN){
+  for(i in 1:84){
+  PatientsBooty4[[j]][[i]]<-lapply(seq(1,length(Split_booty4[[j]][[i]][['time']])-Scale-1,by=Slide), function(x) cov(Split_booty4[[j]][[i]][x:(x+Scale-1),3:31]))
+  }
+}
+
+
+GGOccupancyP104<-NULL
+GGDwellP104<-NULL
+GGSwitchP104<-NULL
+P104<-NULL
+PAA1MCluster4<-NULL
+NSSIP104<-NULL
+StateSwitchBooty4<-NULL
+OccupancyDatAllBooty4<-NULL
+RLE_AllBooty4<-NULL
+OccTest4<-NULL
+SwitchTest4<-NULL
+DwellTest4<-NULL
+for(i in 1:SampleN){
+PA10Booty4<-PatientsBooty4[[i]]%>%unlist(recursive = F)
+
+PAA14<-get.distances(PA10Booty4)%>%as.dist()%>%as.matrix()
+PAA1MCluster4[[i]]<-kmeans(PAA14,centers = 5)
+
+SplitP104<-split(PAA1MCluster4[[i]]$cluster,
+                 ceiling(seq_along(PAA1MCluster4[[i]]$centers)
+/length(PatientsBooty4[[i]][[1]])))
+SplitP104<-SplitP104[1:84]
+MergeP104<-vector("list",84)
+for (p in 1:length(SplitP104)) {
+  for(j in 1:length(SplitP104[[i]])){
+    MergeP104[[p]][[j]]<-rep(SplitP104[[p]][[j]],Slide)
+  }
+}
+MergierP104<-MergeP104%>%unlist(recursive = F)
+
+for (k in 1:length(Split_booty4[[1]])) {
+  for(m in 1:length(PatientsBooty4[[1]][[1]])){
+  Split_booty4[[i]][[k]][[m+35]]<-c(rep(NA,(m)*(Slide)),MergeP104[[k]][[m]],rep(NA,length(Split_booty4[[i]][[k]][[1]])-length(MergeP104[[k]][[m]])-(m)*(Slide)))
+  }
+}
+
+
+Booty44<-unsplit(Split_booty4[[i]],Booty4[[i]][["grid"]])
+
+Booty4A4<-Booty44%>%unite(col="Cluster",V36:V91,na.rm=T,sep="")%>%
+  mutate(Cluster=case_when(Cluster==""~lag(Cluster,n=Slide),
+                           T~Cluster),
+         Occupancy=case_when(Cluster!=lag(Cluster)~1,
+                             T~0),
+         Cluster=factor(Cluster))%>%
+  filter(!Cluster=="")%>%
+  mutate(Cluster=fct_infreq(Cluster,ordered = T),
+                 Cluster=factor(Cluster,labels=c(1:5)))
+
+OccupancyDatAllBooty4[[i]]<-Booty4A4%>%
+  count(Lifetime.NSSI.Group,Cluster)%>%
+  filter(Cluster!="")%>%
+  ungroup()%>%
+  group_by(Lifetime.NSSI.Group)%>%
+  mutate(Freq=n/sum(n))
+
+
+StateSwitchBooty4[[i]]<-Booty4A4%>%group_by(Lifetime.NSSI.Group)%>%
+  count(Occupancy)%>%ungroup()%>%
+  group_by(Lifetime.NSSI.Group)%>%
+  mutate(Freq=n/sum(n))
+
+
+RLE_AllBooty4[[i]]<-Booty4A4%>%group_by(grid,Lifetime.NSSI.Group)%>%
+  mutate(Cluster=as.numeric(Cluster))%>%
+  summarise(RLE_cluster=rle(Cluster)$values,
+            RLE_length=rle(Cluster)$lengths)%>%
+  filter(!RLE_cluster=="")%>%
+  mutate(RLE_cluster=factor(RLE_cluster),
+         RLE_length=as.numeric(RLE_length),
+         grid=factor(grid))%>%
+  group_by(Lifetime.NSSI.Group,RLE_cluster)%>%
+  summarise(RLE_length=median(RLE_length))
+
+}
+```
+
+# 105
+
+```{r}
+
+Split_booty5<-NULL
+Booty5<-NULL
+for(i in 1:SampleN){
+Booty_mod<-inner_join(Bridges,sample(unique(Bridges$grid[Bridges$Lifetime.NSSI.Group=="Moderate NSSI"]),size = 40,replace = F)%>%
+                        data.frame()%>%dplyr::rename(grid="."),by="grid") 
+
+Booty_no<-inner_join(Bridges,sample(unique(Bridges$grid[Bridges$Lifetime.NSSI.Group=="No NSSI"]),
+                                    size = 30,replace = F)%>%
+                       data.frame()%>%dplyr::rename(grid="."),by="grid") 
+
+Booty_mild<-inner_join(Bridges,sample(unique(Bridges$grid[Bridges$Lifetime.NSSI.Group=="Mild NSSI"]),size = 10,replace = F)%>%
+                         data.frame()%>%dplyr::rename(grid="."),by="grid") 
+
+Booty_severe<-inner_join(Bridges,sample(unique(Bridges$grid[Bridges$Lifetime.NSSI.Group=="Severe NSSI"]),size = 25,replace = F)%>%
+                           data.frame()%>%dplyr::rename(grid="."),by="grid") 
+
+Booty5[[i]]<-rbind(Booty_mild,Booty_mod,Booty_no,Booty_severe)%>%
+  mutate(across(.cols=time:V26))%>%as.data.frame()
+Split_booty5[[i]]<-split(Booty5[[i]],Booty5[[i]]$grid)        
+}
+
+Scale<-75
+PatientsBooty5<-vector("list",SampleN)
+for(j in 1:SampleN){
+  for(i in 1:105){
+  PatientsBooty5[[j]][[i]]<-lapply(seq(1,length(Split_booty5[[j]][[i]][['time']])-Scale-1,by=Slide), function(x) cov(Split_booty5[[j]][[i]][x:(x+Scale-1),3:31]))
+  }
+}
+
+
+GGOccupancyP105<-NULL
+GGDwellP105<-NULL
+GGSwitchP105<-NULL
+P105<-NULL
+PAA1MCluster5<-NULL
+NSSIP105<-NULL
+StateSwitchBooty5<-NULL
+OccupancyDatAllBooty5<-NULL
+RLE_AllBooty5<-NULL
+OccTest5<-NULL
+SwitchTest5<-NULL
+DwellTest5<-NULL
+for(i in 1:SampleN){
+PA10Booty5<-PatientsBooty5[[i]]%>%unlist(recursive = F)
+
+PAA15<-get.distances(PA10Booty5)%>%as.dist()%>%as.matrix()
+PAA1MCluster5[[i]]<-kmeans(PAA15,centers = 5)
+
+
+SplitP105<-split(PAA1MCluster5[[i]]$cluster,
+                 ceiling(seq_along(PAA1MCluster5[[i]]$centers)
+/length(PatientsBooty5[[i]][[1]])))
+SplitP105<-SplitP105[1:105]
+MergeP105<-vector("list",105)
+for (p in 1:length(SplitP105)) {
+  for(j in 1:length(SplitP105[[i]])){
+    MergeP105[[p]][[j]]<-rep(SplitP105[[p]][[j]],Slide)
+  }
+}
+MergierP105<-MergeP105%>%unlist(recursive = F)
+
+for (k in 1:length(Split_booty5[[1]])) {
+  for(m in 1:length(PatientsBooty5[[1]][[1]])){
+  Split_booty5[[i]][[k]][[m+35]]<-c(rep(NA,(m)*(Slide)),MergeP105[[k]][[m]],rep(NA,length(Split_booty5[[i]][[k]][[1]])-length(MergeP105[[k]][[m]])-(m)*(Slide)))
+  }
+}
+
+
+Booty45<-unsplit(Split_booty5[[i]],Booty5[[i]][["grid"]])
+
+Booty4A5<-Booty45%>%unite(col="Cluster",V36:V91,na.rm=T,sep="")%>%
+  mutate(Cluster=case_when(Cluster==""~lag(Cluster,n=Slide),
+                           T~Cluster),
+         Occupancy=case_when(Cluster!=lag(Cluster)~1,
+                             T~0),
+         Cluster=factor(Cluster))%>%
+  filter(!Cluster=="")%>%
+  mutate(Cluster=fct_infreq(Cluster,ordered = T),
+                 Cluster=factor(Cluster,labels=c(1:5)))
+
+OccupancyDatAllBooty5[[i]]<-Booty4A5%>%
+  count(Lifetime.NSSI.Group,Cluster)%>%
+  filter(Cluster!="")%>%
+  ungroup()%>%
+  group_by(Lifetime.NSSI.Group)%>%
+  mutate(Freq=n/sum(n))
+
+
+StateSwitchBooty5[[i]]<-Booty4A5%>%group_by(Lifetime.NSSI.Group)%>%
+  count(Occupancy)%>%ungroup()%>%
+  group_by(Lifetime.NSSI.Group)%>%
+  mutate(Freq=n/sum(n))
+
+
+RLE_AllBooty5[[i]]<-Booty4A5%>%group_by(grid,Lifetime.NSSI.Group)%>%
+  mutate(Cluster=as.numeric(Cluster))%>%
+  summarise(RLE_cluster=rle(Cluster)$values,
+            RLE_length=rle(Cluster)$lengths)%>%
+  filter(!RLE_cluster=="")%>%
+  mutate(RLE_cluster=factor(RLE_cluster),
+         RLE_length=as.numeric(RLE_length),
+         grid=factor(grid))%>%
+  group_by(Lifetime.NSSI.Group,RLE_cluster)%>%
+  summarise(RLE_length=median(RLE_length))
+}
+
+```
+
+# Bootstrap Visualizations
+
+```{r}
+
+# Combining State Switching Bootstraps
+Switch<-NULL
+for(i in 1:length(StateSwitchBooty)){
+  Switch<-rbind(Switch,StateSwitchBooty[[i]])
+}
+for(i in 1:length(StateSwitchBooty2)){
+  Switch<-rbind(Switch,StateSwitchBooty2[[i]])
+}
+for(i in 1:length(StateSwitchBooty3)){
+  Switch<-rbind(Switch,StateSwitchBooty3[[i]])
+}
+for(i in 1:length(StateSwitchBooty4)){
+  Switch<-rbind(Switch,StateSwitchBooty4[[i]])
+}
+
+for(i in 1:length(StateSwitchBooty5)){
+  Switch<-rbind(Switch,StateSwitchBooty5[[i]])
+}
+
+Switch<-rbind(Switch,StateSwitch3_2) # adding full sample size estimate
+
+# adding iteration info
+Switch$Iteration<-c(rep(rep(c(1:length(StateSwitchBooty)),
+                            each=length(StateSwitch3_2$Occupancy)),5),
+                    rep(11,length(StateSwitch3_2$Occupancy)))
+# adding sub sample size info
+Switch$Sample<-c(rep(c("21","42","63","84","105"),
+                     each=length(StateSwitch3_2$Occupancy)*length(StateSwitchBooty)),
+                 rep("126",length(StateSwitch3_2$Occupancy)))
+
+# adding overall vs bootstrap
+Switch$Overall<-c(rep("0",length(Switch$Sample)-length(StateSwitch3_2$Occupancy)),
+                  rep("1",length(StateSwitch3_2$Occupancy)))
+Switch$Sample<-factor(Switch$Sample,levels = c("21","42","63","84","105","126"))
+Switch$Lifetime.NSSI.Group<-factor(Switch$Lifetime.NSSI.Group,
+                                   levels = c("No NSSI","Mild NSSI",
+                                              "Moderate NSSI","Severe NSSI"))
+
+# Combining Proportional Occupancy Bootstraps
+
+Occ<-NULL
+for(i in 1:length(OccupancyDatAllBooty)){
+  Occ<-rbind(Occ,OccupancyDatAllBooty[[i]])
+}
+for(i in 1:length(OccupancyDatAllBooty2)){
+  Occ<-rbind(Occ,OccupancyDatAllBooty2[[i]])
+}
+for(i in 1:length(OccupancyDatAllBooty3)){
+  Occ<-rbind(Occ,OccupancyDatAllBooty3[[i]])
+}
+for(i in 1:length(OccupancyDatAllBooty4)){
+  Occ<-rbind(Occ,OccupancyDatAllBooty4[[i]])
+}
+
+for(i in 1:length(OccupancyDatAllBooty5)){
+  Occ<-rbind(Occ,OccupancyDatAllBooty5[[i]])
+}
+
+Occ<-rbind(Occ, OccupancyDatAll3_2) # adding full sample size estimate
+
+# adding iteration info
+Iteration<-NULL
+for(i in 1:length(OccupancyDatAllBooty)){
+  Iteration<-c(Iteration,rep(i,length(OccupancyDatAllBooty[[i]][[1]])))
+}
+for(i in 1:length(OccupancyDatAllBooty2)){
+  Iteration<-c(Iteration,rep(i,length(OccupancyDatAllBooty2[[i]][[1]])))
+}
+for(i in 1:length(OccupancyDatAllBooty3)){
+  Iteration<-c(Iteration,rep(i,length(OccupancyDatAllBooty3[[i]][[1]])))
+}
+for(i in 1:length(OccupancyDatAllBooty4)){
+  Iteration<-c(Iteration,rep(i,length(OccupancyDatAllBooty4[[i]][[1]])))
+}
+for(i in 1:length(OccupancyDatAllBooty5)){
+  Iteration<-c(Iteration,rep(i,length(OccupancyDatAllBooty5[[i]][[1]])))
+}
+
+# adding iteration info
+Iteration<-c(Iteration,rep(11,length(OccupancyDatAll3_2$Cluster)))
+Occ$Iteration<-Iteration
+
+# adding sample size info
+Sample<-NULL
+for(i in 1:length(OccupancyDatAllBooty)){
+  Sample<-c(Sample,rep("21",length(OccupancyDatAllBooty[[i]][[1]])))
+}
+for(i in 1:length(OccupancyDatAllBooty2)){
+  Sample<-c(Sample,rep("42",length(OccupancyDatAllBooty2[[i]][[1]])))
+}
+for(i in 1:length(OccupancyDatAllBooty3)){
+  Sample<-c(Sample,rep("63",length(OccupancyDatAllBooty3[[i]][[1]])))
+}
+for(i in 1:length(OccupancyDatAllBooty4)){
+  Sample<-c(Sample,rep("84",length(OccupancyDatAllBooty4[[i]][[1]])))
+}
+for(i in 1:length(OccupancyDatAllBooty5)){
+  Sample<-c(Sample,rep("105",length(OccupancyDatAllBooty5[[i]][[1]])))
+}
+
+Sample<-c(Sample,rep("126",length(OccupancyDatAll3_2$Cluster)))
+
+
+Occ$Sample<-Sample
+Occ$Sample<-factor(Occ$Sample,levels = c("21","42","63","84","105","126"))
+Occ$Overall<-c(rep("0",length(Occ$Sample)-length(OccupancyDatAll3_2$Cluster)),
+               rep("1",length(OccupancyDatAll3_2$Cluster)))
+Occ$Lifetime.NSSI.Group<-factor(Occ$Lifetime.NSSI.Group,levels = c("No NSSI","Mild NSSI","Moderate NSSI","Severe NSSI"))
+
+
+
+# Dwell time bootstrap combining
+Dwell<-NULL
+for(i in 1:length(RLE_AllBooty)){
+  Dwell<-rbind(Dwell,RLE_AllBooty[[i]])
+}
+for(i in 1:length(RLE_AllBooty2)){
+  Dwell<-rbind(Dwell,RLE_AllBooty2[[i]])
+}
+for(i in 1:length(RLE_AllBooty3)){
+  Dwell<-rbind(Dwell,RLE_AllBooty3[[i]])
+}
+for(i in 1:length(RLE_AllBooty4)){
+  Dwell<-rbind(Dwell,RLE_AllBooty4[[i]])
+}
+
+for(i in 1:length(RLE_AllBooty5)){
+  Dwell<-rbind(Dwell,RLE_AllBooty5[[i]])
+}
+
+
+Dwell<-rbind(Dwell, RLE_All3_2)
+
+Iteration<-NULL
+for(i in 1:length(RLE_AllBooty)){
+  Iteration<-c(Iteration,rep(i,length(RLE_AllBooty[[i]][[1]])))
+}
+for(i in 1:length(RLE_AllBooty2)){
+  Iteration<-c(Iteration,rep(i,length(RLE_AllBooty2[[i]][[1]])))
+}
+for(i in 1:length(RLE_AllBooty3)){
+  Iteration<-c(Iteration,rep(i,length(RLE_AllBooty3[[i]][[1]])))
+}
+for(i in 1:length(RLE_AllBooty4)){
+  Iteration<-c(Iteration,rep(i,length(RLE_AllBooty4[[i]][[1]])))
+}
+for(i in 1:length(RLE_AllBooty5)){
+  Iteration<-c(Iteration,rep(i,length(RLE_AllBooty5[[i]][[1]])))
+}
+
+
+Iteration<-c(Iteration,rep(11,length(RLE_All3_2$RLE_cluster)))
+Dwell$Iteration<-Iteration
+Sample<-NULL
+for(i in 1:length(RLE_AllBooty)){
+  Sample<-c(Sample,rep("21",length(RLE_AllBooty[[i]][[1]])))
+}
+for(i in 1:length(RLE_AllBooty2)){
+  Sample<-c(Sample,rep("42",length(RLE_AllBooty2[[i]][[1]])))
+}
+for(i in 1:length(RLE_AllBooty3)){
+  Sample<-c(Sample,rep("63",length(RLE_AllBooty3[[i]][[1]])))
+}
+for(i in 1:length(RLE_AllBooty4)){
+  Sample<-c(Sample,rep("84",length(RLE_AllBooty4[[i]][[1]])))
+}
+for(i in 1:length(RLE_AllBooty5)){
+  Sample<-c(Sample,rep("105",length(RLE_AllBooty5[[i]][[1]])))
+}
+
+Sample<-c(Sample,rep("126",length(RLE_All3_2$RLE_cluster)))
+
+
+Dwell$Sample<-Sample
+Dwell$Sample<-factor(Dwell$Sample,levels = c("21","42","63","84","105","126"))
+Dwell$Overall<-c(rep("0",length(Dwell$Sample)-length(RLE_All3_2$RLE_cluster)),
+               rep("1",length(RLE_All3_2$RLE_cluster)))
+Dwell$Lifetime.NSSI.Group<-factor(Dwell$Lifetime.NSSI.Group,
+                                  levels = c("No NSSI","Mild NSSI",
+                                             "Moderate NSSI","Severe NSSI"))
+```
+
+# State Switching Visualizations
+
+```{r,fig.width=10}
+SwitchAvg<-Switch%>%ungroup()%>%group_by(Sample,Iteration)%>%
+  mutate(Freq=n/sum(n))%>%group_by(Sample,Iteration,Occupancy)%>%
+  mutate(Freq=sum(Freq))%>%
+  filter(Lifetime.NSSI.Group=="Mild NSSI")%>%
+  mutate(Overall=case_when(Sample!="126"~"0",
+                           T~"1"),
+         Sample=factor(Sample,levels=c("21","42","63","84","105","126")))%>%
+  filter(Occupancy==1)
+
+SwitchNSSIAvg<-Switch%>%
+  group_by(Sample,Occupancy,Lifetime.NSSI.Group)%>%
+  summarise(Avg=mean(Freq))%>%
+  mutate(Overall="1",
+         Sample=factor(Sample,levels=c("21","42","63","84","105","126")))
+
+SwitchAvgAvg<-SwitchAvg%>%group_by(Sample,Occupancy)%>%
+  summarise(Avg=mean(Freq))%>%
+  mutate(Lifetime.NSSI.Group="Overall Average",
+         Overall="1",
+         Sample=factor(Sample,levels=c("21","42","63","84","105","126")))
+Switch2<-Switch%>%filter(Occupancy==1)
+ggplot(data=subset(SwitchNSSIAvg,Occupancy==1),
+                 aes(x=Sample,y=Avg),show.legend = F)+
+  geom_jitter(data=Switch2,
+              aes(x=Sample,y=Freq,col=Lifetime.NSSI.Group,alpha=Overall),
+              width = 0.1,show.legend = F)+
+  geom_point(data=subset(SwitchNSSIAvg,Occupancy==1),aes(x=Sample,y=Avg,alpha=Overall),
+             col="black",shape=10,show.legend = F,size=8)+
+  ylab(label="State Switching Frequency")+
+  facet_grid(.~Lifetime.NSSI.Group)+
+  scale_alpha_discrete(range=c(0.8,1))+
+  labs(title="N Bootstrapped State Switching Frequency\nby NSSI Group")+
+  scale_color_viridis(discrete = T,begin = 1,end=0)+
+  theme_bw(base_size = 15)
+
+ggplot(data=subset(SwitchAvgAvg,Occupancy==1),
+              aes(x=Sample,y=Avg,col=Sample),show.legend = F)+
+  geom_jitter(data=SwitchAvg,
+              aes(x=factor(Sample),y=Freq,col=Sample),
+              width = 0.1,show.legend = F)+
+  geom_point(data=subset(SwitchAvgAvg,Occupancy==1),
+              aes(x=Sample,y=Avg,col=Sample),show.legend = F,
+             col="black",shape=10,size=8)+
+  ylab(label="State Switching Frequency")+
+  labs(title="N Bootstrapped State Switching Frequency\nOverall")+
+  scale_color_viridis(discrete = T,begin = 1,end=0)+
+  theme_bw()
+
+```
+
+# Proportional Occupancy Visualizations
+
+```{r,fig.width=10,fig.height=10}
+OccAvg<-Occ%>%group_by(Sample,Iteration)%>%mutate(Freq=n/sum(n))%>%
+  group_by(Sample,Iteration,Cluster)%>%
+  mutate(Freq=sum(Freq))%>%
+  group_by(Sample,Iteration,Cluster)%>%
+  distinct(Cluster,.keep_all=T)%>%
+  mutate(Overall=case_when(Sample!="126"~"0",
+                           T~"1"))
+
+
+OccNSSIAvg<-Occ%>%group_by(Sample,Lifetime.NSSI.Group,Cluster)%>%
+  summarise(Avg=mean(Freq))%>%
+  mutate(Overall="1",
+         Sample=factor(Sample,
+                       levels=c("21","42","63","84","105","125","126")))
+
+OccAvgAvg<-OccAvg%>%group_by(Sample,Cluster)%>%
+  summarise(Avg=mean(Freq))%>%
+  mutate(Overall="1",
+         Sample=factor(Sample,
+                       levels=c("21","42","63","84","105","125","126")))
+
+
+OA1<-ggplot(data=subset(OccAvgAvg,Cluster=="1"),aes(x=Sample,y=Avg,col=Cluster,
+                          alpha=Overall),show.legend = F)+
+  geom_point(width = 0.1,height=0,col="black",shape=10,size=7,show.legend = F)+
+  geom_jitter(data=subset(OccAvg,!(Sample=="126")& Cluster=="1"),
+              aes(x=Sample,y=Freq,col=Cluster),alpha=0.2,
+              width=0.1,show.legend = F)+
+  ylab(label = element_blank())+
+  scale_alpha_discrete(range=c(0.6,1))+
+  labs(title="Cluster 1")+
+  scale_color_viridis(discrete = T,begin = 0.3,end=0.1)+
+  theme_bw(base_size = 15)
+
+OA2<-ggplot(data=subset(OccAvgAvg,Cluster=="2"),aes(x=Sample,y=Avg,col=Cluster,
+                          alpha=Overall),show.legend = F)+
+  geom_point(width = 0.1,height=0,col="black",shape=10,size=7,show.legend = F)+
+  geom_jitter(data=subset(OccAvg,!(Sample=="126")& Cluster=="2"),
+              aes(x=Sample,y=Freq,col=Cluster),alpha=0.2,
+              width=0.1,show.legend = F)+
+  ylab(label = element_blank())+
+  scale_alpha_discrete(range=c(0.6,1))+
+  labs(title="Cluster 2")+
+  scale_color_viridis(discrete = T,begin = 0.4,end=0.3)+
+  theme_bw(base_size = 15)
+
+OA3<-ggplot(data=subset(OccAvgAvg,Cluster=="3"),aes(x=Sample,y=Avg,col=Cluster,
+                          alpha=Overall),show.legend = F)+
+  geom_point(width = 0.1,height=0,col="black",shape=10,size=7,show.legend = F)+
+  geom_jitter(data=subset(OccAvg,!(Sample=="126")& Cluster=="3"),
+              aes(x=Sample,y=Freq,col=Cluster),alpha=0.2,
+              width=0.1,show.legend = F)+
+  ylab(label = element_blank())+
+  scale_alpha_discrete(range=c(0.6,1))+
+  labs(title="Cluster 3")+
+  scale_color_viridis(discrete = T,begin = 0.6,end=0.4)+
+  theme_bw(base_size = 15)
+
+
+OA4<-ggplot(data=subset(OccAvgAvg,Cluster=="4"),aes(x=Sample,y=Avg,col=Cluster,
+                          alpha=Overall),show.legend = F)+
+  geom_point(width = 0.1,height=0,col="black",shape=10,size=7,show.legend = F)+
+  geom_jitter(data=subset(OccAvg,!(Sample=="126")& Cluster=="4"),
+              aes(x=Sample,y=Freq,col=Cluster),alpha=0.2,
+              width=0.1,show.legend = F)+
+  ylab(label = "Proportional Occupancy")+
+  scale_alpha_discrete(range=c(0.6,1))+
+  labs(title="Cluster 4")+
+  scale_color_viridis(discrete = T,begin = 0.8,end=0.6)+
+  theme_bw(base_size = 15)
+
+OA5<-ggplot(data=subset(OccAvgAvg,Cluster=="5"),aes(x=Sample,y=Avg,col=Cluster,
+                          alpha=Overall),show.legend = F)+
+  geom_point(width = 0.1,height=0,col="black",shape=10,size=7,show.legend = F)+
+  geom_jitter(data=subset(OccAvg,!(Sample=="126") & Cluster=="5"),
+              aes(x=Sample,y=Freq,col=Cluster),alpha=0.2,
+              width=0.1,show.legend = F)+
+  ylab(label = element_blank())+
+  scale_alpha_discrete(range=c(0.6,1))+
+  labs(title="Cluster 5")+
+  scale_color_viridis(discrete = T,begin = 1,end=0.8)+
+  theme_bw(base_size = 15)
+
+ggarrange(OA1,OA2,OA3,OA4,OA5)
+
+
+OB1<-ggplot(data=subset(Occ,Cluster=="1" ),aes(x=Sample,y=Freq,col=Cluster,
+                           alpha=Overall),width = 0.1)+
+  geom_jitter(width = 0.1,height=0,
+              aes(alpha=Overall),
+              show.legend = F)+
+   geom_point(data=subset(OccNSSIAvg,Cluster=="1"),aes(x=Sample,y=Avg,
+               col=Cluster),col="black",shape=10,size=7,show.legend = F)+
+  facet_grid(Cluster~Lifetime.NSSI.Group)+
+  ylab(label = element_blank())+
+  scale_alpha_discrete(range=c(0.4,1))+
+  labs(title="Cluster 1")+
+  scale_color_viridis(discrete = T,begin = 0.3,end=0.1)+
+  theme_bw(base_size = 18)
+
+OB2<-ggplot(data=subset(Occ,Cluster=="2"),aes(x=Sample,y=Freq,col=Cluster,
+                           alpha=Overall),width = 0.1)+
+  geom_jitter(width = 0.1,height=0,
+              aes(alpha=Overall),
+              show.legend = F)+
+   geom_point(data=subset(OccNSSIAvg,Cluster=="2"),aes(x=Sample,y=Avg,
+               col=Cluster),col="black",shape=10,size=7,show.legend = F)+
+  facet_grid(Cluster~Lifetime.NSSI.Group)+
+  ylab(label = element_blank())+
+  scale_alpha_discrete(range=c(0.4,1))+
+  labs(title="Cluster 2")+
+  scale_color_viridis(discrete = T,begin = 0.4,end=0.3)+
+  theme_bw(base_size = 18)
+
+OB3<-ggplot(data=subset(Occ,Cluster=="3"),aes(x=Sample,y=Freq,col=Cluster,
+                           alpha=Overall),width = 0.1)+
+  geom_jitter(width = 0.1,height=0,
+              aes(alpha=Overall),
+              show.legend = F)+
+   geom_point(data=subset(OccNSSIAvg,Cluster=="3"),aes(x=Sample,y=Avg,
+               col=Cluster),col="black",shape=10,size=7,show.legend = F)+
+  facet_grid(Cluster~Lifetime.NSSI.Group)+
+  ylab(label = element_blank())+
+  scale_alpha_discrete(range=c(0.4,1))+
+  labs(title="Cluster 3")+
+  scale_color_viridis(discrete = T,begin = 0.6,end=0.4)+
+  theme_bw(base_size = 18)
+
+OB4<-ggplot(data=subset(Occ,Cluster=="4"),aes(x=Sample,y=Freq,col=Cluster,
+                           alpha=Overall),width = 0.1)+
+  geom_jitter(width = 0.1,height=0,
+              aes(alpha=Overall),
+              show.legend = F)+
+   geom_point(data=subset(OccNSSIAvg,Cluster=="4"),aes(x=Sample,y=Avg,
+               col=Cluster),col="black",shape=10,size=7,show.legend = F)+
+  facet_grid(Cluster~Lifetime.NSSI.Group)+
+  ylab(label = "Proportional Occupancy")+
+  scale_alpha_discrete(range=c(0.4,1))+
+  labs(title="Cluster 4")+
+  scale_color_viridis(discrete = T,begin = 0.8,end=0.6)+
+  theme_bw(base_size = 18)
+
+OB5<-ggplot(data=subset(Occ,Cluster=="5"),aes(x=Sample,y=Freq,col=Cluster,
+                           alpha=Overall),width = 0.1)+
+  geom_jitter(width = 0.1,height=0,
+              aes(alpha=Overall),
+              show.legend = F)+
+   geom_point(data=subset(OccNSSIAvg,Cluster=="5"),aes(x=Sample,y=Avg,
+               col=Cluster),col="black",shape=10,size=7,show.legend = F)+
+  facet_grid(Cluster~Lifetime.NSSI.Group)+
+  ylab(label =element_blank())+
+  scale_alpha_discrete(range=c(0.4,1))+
+  labs(title="Cluster 5")+
+  scale_color_viridis(discrete = T,begin = 1.0,end=0.8)+
+  theme_bw(base_size = 18)
+
+ggarrange(OB1,OB2,OB3,OB4,OB5,nrow = 3)
+
+```
+
+# Dwell Time Visuallizations
+
+```{r,fig.width=10,fig.height=10}
+DwellAvg<-Dwell%>%group_by(Sample,Iteration,RLE_cluster)%>%
+  mutate(Avg=mean(RLE_length))%>%
+  mutate(Overall=case_when(Sample!="126"~"0",
+                           T~"1"))
+
+DwellNSSIAvg<-Dwell%>%
+  group_by(Sample,Lifetime.NSSI.Group,RLE_cluster)%>%
+  summarise(Avg=mean(RLE_length))%>%
+  mutate(Overall="1",
+         Sample=factor(Sample,
+                       levels=c("21","42","63","84","105","126")))
+
+DwellAvgAvg<-DwellAvg%>%group_by(Sample,RLE_cluster)%>%
+  summarise(Avg=mean(RLE_length))%>%
+  mutate(Overall="1",
+         Sample=factor(Sample,
+                       levels=c("21","42","63","84","105","126")))
+
+DA1<-ggplot(data=subset(DwellAvgAvg,RLE_cluster=="1"),
+       aes(x=Sample,y=Avg,col=RLE_cluster),show.legend = F)+
+  geom_point(width = 0.1,height=0,col="black",shape=10,size=7,show.legend = F)+
+  geom_jitter(data=subset(DwellAvg,!(Sample=="126")& RLE_cluster=="1"),
+              aes(x=Sample,y=Avg,col=RLE_cluster),alpha=0.1,
+              width=0.1,show.legend = F)+
+  ylab(label = element_blank())+
+  scale_alpha_discrete(range=c(0.6,1))+
+  labs(title="Cluster 1")+
+  scale_color_viridis(discrete = T,begin = 0.3,end=0.1)+
+  theme_bw(base_size = 15)
+
+DA2<-ggplot(data=subset(DwellAvgAvg,RLE_cluster=="2"),
+       aes(x=Sample,y=Avg,col=RLE_cluster),show.legend = F)+
+  geom_point(width = 0.1,height=0,col="black",shape=10,size=7,show.legend = F)+
+  geom_jitter(data=subset(DwellAvg,!(Sample=="126")& RLE_cluster=="2"),
+              aes(x=Sample,y=Avg,col=RLE_cluster),alpha=0.1,
+              width=0.1,show.legend = F)+
+  ylab(label = element_blank())+
+  scale_alpha_discrete(range=c(0.6,1))+
+  labs(title="Cluster 2")+
+  scale_color_viridis(discrete = T,begin = 0.4,end=0.3)+
+  theme_bw(base_size = 15)
+
+DA3<-ggplot(data=subset(DwellAvgAvg,RLE_cluster=="3"),
+       aes(x=Sample,y=Avg,col=RLE_cluster,),show.legend = F)+
+  geom_point(width = 0.1,height=0,col="black",shape=10,size=7,show.legend = F)+
+  geom_jitter(data=subset(DwellAvg,!(Sample=="126")& RLE_cluster=="3"),
+              aes(x=Sample,y=Avg,col=RLE_cluster),alpha=0.1,
+              width=0.1,show.legend = F)+
+  ylab(label = element_blank())+
+  scale_alpha_discrete(range=c(0.6,1))+
+  labs(title="Cluster 3")+
+  scale_color_viridis(discrete = T,begin = 0.6,end=0.4)+
+  theme_bw(base_size = 15)
+
+
+DA4<-ggplot(data=subset(DwellAvgAvg,RLE_cluster=="4"),
+       aes(x=Sample,y=Avg,col=RLE_cluster),show.legend = F)+
+  geom_point(width = 0.1,height=0,col="black",shape=10,size=7,show.legend = F)+
+  geom_jitter(data=subset(DwellAvg,!(Sample=="126")& RLE_cluster=="4"),
+              aes(x=Sample,y=Avg,col=RLE_cluster),alpha=0.1,
+              width=0.1,show.legend = F)+
+  ylab(label = "Dwell Time")+
+  scale_alpha_discrete(range=c(0.6,1))+
+  labs(title="Cluster 4")+
+  scale_color_viridis(discrete = T,begin = 0.8,end=0.6)+
+  theme_bw(base_size = 15)
+
+DA5<-ggplot(data=subset(DwellAvgAvg,RLE_cluster=="5"),
+       aes(x=Sample,y=Avg,col=RLE_cluster),show.legend = F)+
+  geom_point(width = 0.1,height=0,col="black",shape=10,size=7,show.legend = F)+
+  geom_jitter(data=subset(DwellAvg,!(Sample=="126") & RLE_cluster=="5"),
+              aes(x=Sample,y=Avg,col=RLE_cluster),alpha=0.1,
+              width=0.1,show.legend = F)+
+  ylab(label = element_blank())+
+  scale_alpha_discrete(range=c(0.6,1))+
+  labs(title="Cluster 5")+
+  scale_color_viridis(discrete = T,begin = 1,end=0.8)+
+  theme_bw(base_size = 15)
+
+ggarrange(DA1,DA2,DA3,DA4,DA5)
+
+
+DB1<-ggplot(data=subset(DwellNSSIAvg,RLE_cluster=="1"),
+       aes(x=Sample,y=Avg,col=RLE_cluster),show.legend = F)+
+  geom_point(width = 0.1,height=0,col="black",shape=10,size=7,show.legend = F)+
+  geom_jitter(data=subset(Dwell,!(Sample=="126") & RLE_cluster=="1"),
+              aes(x=Sample,y=RLE_length,col=RLE_cluster),alpha=0.3,
+              width=0.1,show.legend = F)+
+  facet_grid(.~Lifetime.NSSI.Group)+
+  ylab(label = element_blank())+
+  scale_alpha_discrete(range=c(0.6,1))+
+  labs(title="Cluster 1")+
+  scale_color_viridis(discrete = T,begin = 0.3,end=0.1)+
+  theme_bw(base_size = 15)
+
+DB2<-ggplot(data=subset(DwellNSSIAvg,RLE_cluster=="2"),
+       aes(x=Sample,y=Avg,col=RLE_cluster),show.legend = F)+
+  geom_point(width = 0.1,height=0,col="black",shape=10,size=7,show.legend = F)+
+  geom_jitter(data=subset(Dwell,!(Sample=="126")& RLE_cluster=="2"),
+              aes(x=Sample,y=RLE_length,col=RLE_cluster),alpha=0.3,
+              width=0.1,show.legend = F)+
+  facet_grid(.~Lifetime.NSSI.Group)+
+  ylab(label =element_blank())+
+  scale_alpha_discrete(range=c(0.6,1))+
+  labs(title="Cluster 2")+
+  scale_color_viridis(discrete = T,begin = 0.4,end=0.3)+
+  theme_bw(base_size = 15)
+
+DB3<-ggplot(data=subset(DwellNSSIAvg,RLE_cluster=="3"),
+       aes(x=Sample,y=Avg,col=RLE_cluster,),show.legend = F)+
+  geom_point(width = 0.1,height=0,col="black",shape=10,size=7,show.legend = F)+
+  geom_jitter(data=subset(Dwell,!(Sample=="126")& RLE_cluster=="3"),
+              aes(x=Sample,y=RLE_length,col=RLE_cluster),alpha=0.3,
+              width=0.1,show.legend = F)+
+  facet_grid(.~Lifetime.NSSI.Group)+
+  ylab(label = element_blank())+
+  scale_alpha_discrete(range=c(0.6,1))+
+  labs(title="Cluster 3")+
+  scale_color_viridis(discrete = T,begin = 0.6,end=0.4)+
+  theme_bw(base_size = 15)
+
+
+DB4<-ggplot(data=subset(DwellNSSIAvg,RLE_cluster=="4"),
+       aes(x=Sample,y=Avg,col=RLE_cluster),show.legend = F)+
+  geom_point(width = 0.1,height=0,col="black",shape=10,size=7,show.legend = F)+
+  geom_jitter(data=subset(Dwell,!(Sample=="126")& RLE_cluster=="4"),
+              aes(x=Sample,y=RLE_length,col=RLE_cluster),alpha=0.3,
+              width=0.1,show.legend = F)+
+  facet_grid(.~Lifetime.NSSI.Group)+
+  ylab(label = "Dwell Time")+
+  scale_alpha_discrete(range=c(0.6,1))+
+  labs(title="Cluster 4")+
+  scale_color_viridis(discrete = T,begin = 0.8,end=0.6)+
+  theme_bw(base_size = 15)
+
+DB5<-ggplot(data=subset(DwellNSSIAvg,RLE_cluster=="5"),
+       aes(x=Sample,y=Avg,col=RLE_cluster),show.legend = F)+
+  geom_point(width = 0.1,height=0,col="black",shape=10,size=7,show.legend = F)+
+  geom_jitter(data=subset(Dwell,!(Sample=="126") & RLE_cluster=="5"),
+              aes(x=Sample,y=RLE_length,col=RLE_cluster),alpha=0.3,
+              width=0.1,show.legend = F)+
+  facet_grid(.~Lifetime.NSSI.Group)+
+  ylab(label = element_blank())+
+  scale_alpha_discrete(range=c(0.6,1))+
+  labs(title="Cluster 5")+
+  scale_color_viridis(discrete = T,begin = 1,end=0.8)+
+  theme_bw(base_size = 15)
+
+ggarrange(DB1,DB2,DB3,DB4,DB5,nrow=3)
+
+```
